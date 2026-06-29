@@ -1,5 +1,14 @@
-// Package adapters — Reddit OAuth2 adapter.
-// Fetches posts and comments from 12 target subreddits matching frustration-signal phrases.
+// Package adapters — Reddit adapter via RapidAPI's "Reddit34" wrapper.
+//
+// Reddit's official OAuth2 Data API now requires manual approval ("valid moderation
+// use case") that this project's read-only analytics use case does not qualify for
+// under self-service. This adapter is a stopgap against a commercial third-party API
+// while the official Reddit Data Access Request is pending. Swapping back to OAuth2
+// later only requires rewriting this file — nothing outside it depends on the
+// transport mechanism, by design of the PlatformAdapter interface.
+//
+// Fetches each subreddit's newest posts once per call (not once per search phrase —
+// metered APIs charge per request, so phrase-matching happens client-side instead).
 package adapters
 
 import (
@@ -11,18 +20,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
-const (
-	redditTokenURL   = "https://www.reddit.com/api/v1/access_token"
-	redditSearchURL  = "https://oauth.reddit.com/r/%s/search.json"
-	redditUserAgent  = "wantedby-ingestor/1.0 (by /u/wantedby_bot)"
-	redditMaxWorkers = 5
-)
+const redditRapidAPIPathFmt = "https://%s/getPostsBySubreddit"
 
 var targetSubreddits = []string{
 	"SideProject",
@@ -56,112 +57,77 @@ var frustrationPhrases = []string{
 	"every time I need to",
 }
 
-// RedditAdapter fetches frustration-signal posts from Reddit via OAuth2.
-type RedditAdapter struct {
-	clientID     string
-	clientSecret string
-	limiter      *rate.Limiter
-	httpClient   *http.Client
-	logger       *slog.Logger
+// redditRequestDelay throttles requests to one at a time with a pause between
+// each call. RapidAPI's Basic/free tier rate-limits well below its advertised
+// hourly ceiling on request bursts, so concurrency buys nothing here and only
+// risks 429s — sequential is both safe and sufficient at this volume.
+// A var (not const) so tests can shrink it and avoid a slow test suite.
+var redditRequestDelay = 2 * time.Second
 
-	tokenMu     sync.Mutex
-	accessToken string
-	tokenExpiry time.Time
+// RedditAdapter fetches subreddit posts via the RapidAPI Reddit34 wrapper and
+// filters for frustration-signal phrases client-side.
+type RedditAdapter struct {
+	apiKey     string
+	apiHost    string
+	httpClient *http.Client
+	logger     *slog.Logger
 }
 
-// NewRedditAdapter constructs a RedditAdapter. clientID and clientSecret come from env vars.
-func NewRedditAdapter(clientID, clientSecret string, logger *slog.Logger) *RedditAdapter {
+// NewRedditAdapter constructs a RedditAdapter. apiKey and apiHost come from
+// REDDIT_RAPIDAPI_KEY and REDDIT_RAPIDAPI_HOST env vars.
+func NewRedditAdapter(apiKey, apiHost string, logger *slog.Logger) *RedditAdapter {
 	return &RedditAdapter{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		limiter:      rate.NewLimiter(rate.Every(time.Minute/60), 1),
-		httpClient:   &http.Client{Timeout: 15 * time.Second},
-		logger:       logger,
+		apiKey:     apiKey,
+		apiHost:    apiHost,
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+		logger:     logger,
 	}
 }
 
 // Name returns the platform identifier.
 func (r *RedditAdapter) Name() string { return "reddit" }
 
-// FetchSince returns all matching posts from all 12 subreddits published after since.
-// Subreddit fetches are parallelised with a worker pool of max 5.
+// FetchSince fetches the newest posts from all 12 target subreddits, one
+// request at a time with a delay between each, and returns only those
+// published after since AND matching at least one frustration-signal phrase
+// in title or body.
 func (r *RedditAdapter) FetchSince(ctx context.Context, since time.Time) ([]RawPost, error) {
-	if err := r.ensureToken(ctx); err != nil {
-		return nil, fmt.Errorf("reddit auth: %w", err)
-	}
-
-	type result struct {
-		posts []RawPost
-		err   error
-	}
-
-	jobs := make(chan string, len(targetSubreddits))
-	results := make(chan result, len(targetSubreddits))
-
-	for i := 0; i < redditMaxWorkers; i++ {
-		go func() {
-			for sub := range jobs {
-				posts, err := r.fetchSubreddit(ctx, sub, since)
-				results <- result{posts: posts, err: err}
-			}
-		}()
-	}
-
-	for _, sub := range targetSubreddits {
-		jobs <- sub
-	}
-	close(jobs)
-
 	var all []RawPost
-	for range targetSubreddits {
-		res := <-results
-		if res.err != nil {
-			r.logger.Error("reddit fetch error", "error", res.err)
+
+	for i, sub := range targetSubreddits {
+		posts, err := r.fetchSubreddit(ctx, sub, since)
+		if err != nil {
+			r.logger.Error("reddit fetch error", "subreddit", sub, "error", err)
 			continue
 		}
-		all = append(all, res.posts...)
+		all = append(all, posts...)
+
+		if i < len(targetSubreddits)-1 {
+			select {
+			case <-ctx.Done():
+				return all, ctx.Err()
+			case <-time.After(redditRequestDelay):
+			}
+		}
 	}
 	return all, nil
 }
 
-// fetchSubreddit searches one subreddit for all frustration phrases published after since.
+// fetchSubreddit makes one API call for the newest posts in a subreddit, then
+// filters client-side for frustration phrases and the since timestamp.
 func (r *RedditAdapter) fetchSubreddit(ctx context.Context, subreddit string, since time.Time) ([]RawPost, error) {
-	var posts []RawPost
-	sinceUnix := since.Unix()
-
-	for _, phrase := range frustrationPhrases {
-		if err := r.limiter.Wait(ctx); err != nil {
-			return posts, fmt.Errorf("rate limiter: %w", err)
-		}
-
-		batch, err := r.searchSubreddit(ctx, subreddit, phrase, sinceUnix)
-		if err != nil {
-			r.logger.Warn("subreddit search failed", "subreddit", subreddit, "phrase", phrase, "error", err)
-			continue
-		}
-		posts = append(posts, batch...)
-	}
-	return posts, nil
-}
-
-// searchSubreddit executes one search query against the Reddit API.
-func (r *RedditAdapter) searchSubreddit(ctx context.Context, subreddit, query string, sinceUnix int64) ([]RawPost, error) {
-	endpoint := fmt.Sprintf(redditSearchURL, subreddit)
+	endpoint := fmt.Sprintf(redditRapidAPIPathFmt, r.apiHost)
 	params := url.Values{
-		"q":       {query},
-		"sort":    {"new"},
-		"limit":   {"100"},
-		"type":    {"link"},
-		"t":       {"month"},
-		"restrict_sr": {"true"},
+		"subreddit": {subreddit},
+		"sort":      {"new"},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+params.Encode(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+r.accessToken)
-	req.Header.Set("User-Agent", redditUserAgent)
+	req.Header.Set("x-rapidapi-key", r.apiKey)
+	req.Header.Set("x-rapidapi-host", r.apiHost)
 
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
@@ -171,35 +137,43 @@ func (r *RedditAdapter) searchSubreddit(ctx context.Context, subreddit, query st
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("reddit api status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("rapidapi status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var listing redditListing
-	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
-		return nil, fmt.Errorf("decode listing: %w", err)
+	var result rapidAPIPostsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if !result.Success {
+		return nil, fmt.Errorf("rapidapi reported failure for subreddit %s", subreddit)
 	}
 
-	var posts []RawPost
+	sinceUnix := since.Unix()
 	fetchedAt := time.Now().UTC()
-	for _, child := range listing.Data.Children {
+	var posts []RawPost
+
+	for _, child := range result.Data.Posts {
 		p := child.Data
 		createdAt := time.Unix(int64(p.CreatedUTC), 0).UTC()
 		if createdAt.Unix() <= sinceUnix {
 			continue
 		}
+		if !matchesFrustrationPhrase(p.Title, p.Selftext) {
+			continue
+		}
 
 		raw := map[string]any{
-			"id":            p.ID,
-			"name":          p.Name,
-			"subreddit":     p.Subreddit,
-			"title":         p.Title,
-			"selftext":      p.Selftext,
-			"author":        p.Author,
-			"url":           p.URL,
-			"permalink":     p.Permalink,
-			"score":         p.Score,
-			"num_comments":  p.NumComments,
-			"created_utc":   p.CreatedUTC,
+			"id":           p.ID,
+			"name":         p.Name,
+			"subreddit":    p.Subreddit,
+			"title":        p.Title,
+			"selftext":     p.Selftext,
+			"author":       p.Author,
+			"url":          p.URL,
+			"permalink":    p.Permalink,
+			"score":        p.Score,
+			"num_comments": p.NumComments,
+			"created_utc":  p.CreatedUTC,
 		}
 
 		posts = append(posts, RawPost{
@@ -220,58 +194,30 @@ func (r *RedditAdapter) searchSubreddit(ctx context.Context, subreddit, query st
 	return posts, nil
 }
 
-// ensureToken obtains or refreshes the OAuth2 access token using client credentials flow.
-func (r *RedditAdapter) ensureToken(ctx context.Context) error {
-	r.tokenMu.Lock()
-	defer r.tokenMu.Unlock()
-
-	if r.accessToken != "" && time.Now().Before(r.tokenExpiry.Add(-30*time.Second)) {
-		return nil
+// matchesFrustrationPhrase reports whether the title or body contains any of the
+// configured frustration-signal phrases, case-insensitive.
+func matchesFrustrationPhrase(title, body string) bool {
+	haystack := strings.ToLower(title + " " + body)
+	for _, phrase := range frustrationPhrases {
+		if strings.Contains(haystack, strings.ToLower(phrase)) {
+			return true
+		}
 	}
-
-	body := strings.NewReader("grant_type=client_credentials")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, redditTokenURL, body)
-	if err != nil {
-		return fmt.Errorf("build token request: %w", err)
-	}
-	req.SetBasicAuth(r.clientID, r.clientSecret)
-	req.Header.Set("User-Agent", redditUserAgent)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("token request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("token endpoint status %d: %s", resp.StatusCode, string(raw))
-	}
-
-	var tok redditToken
-	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
-		return fmt.Errorf("decode token: %w", err)
-	}
-
-	r.accessToken = tok.AccessToken
-	r.tokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
-	r.logger.Info("reddit token refreshed", "expires_in_seconds", tok.ExpiresIn)
-	return nil
+	return false
 }
 
-// --- Reddit API response types ---
+// --- RapidAPI (Reddit34) response types ---
+// Shape: { success, data: { cursor, posts: [ { kind, data: redditPost } ] } }
+// The inner "data" object matches Reddit's own native listing schema field-for-field.
 
-type redditToken struct {
-	AccessToken string `json:"access_token"`
-	ExpiresIn   int    `json:"expires_in"`
-}
-
-type redditListing struct {
-	Data struct {
-		Children []struct {
+type rapidAPIPostsResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Cursor string `json:"cursor"`
+		Posts  []struct {
+			Kind string     `json:"kind"`
 			Data redditPost `json:"data"`
-		} `json:"children"`
+		} `json:"posts"`
 	} `json:"data"`
 }
 

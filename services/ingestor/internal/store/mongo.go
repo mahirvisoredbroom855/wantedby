@@ -14,10 +14,7 @@ import (
 	"github.com/wantedby/ingestor/internal/adapters"
 )
 
-const (
-	dbName         = "wantedby"
-	collectionName = "raw_posts"
-)
+const collectionName = "raw_posts"
 
 // RawPostDocument is the MongoDB document shape for raw_posts collection.
 type RawPostDocument struct {
@@ -42,8 +39,10 @@ type MongoStore struct {
 	coll *mongo.Collection
 }
 
-// New constructs a MongoStore and ensures the required indexes exist.
-func New(ctx context.Context, client *mongo.Client) (*MongoStore, error) {
+// New constructs a MongoStore against the given database name and ensures the
+// required indexes exist. Production uses "wantedby"; tests use an isolated
+// database name so they never touch real dev data.
+func New(ctx context.Context, client *mongo.Client, dbName string) (*MongoStore, error) {
 	coll := client.Database(dbName).Collection(collectionName)
 
 	indexes := []mongo.IndexModel{

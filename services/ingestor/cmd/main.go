@@ -1,9 +1,16 @@
 // main is the entry point for the pain-ingestor service.
 // It wires all adapters, stores, and publishers, then runs fetch cycles on internal tickers.
+//
+// Reddit is intentionally excluded from the automatic ticker: it currently runs
+// against a metered third-party API (RapidAPI Reddit34, Basic/free tier, 50
+// requests/month) while the official Reddit Data Access Request is pending.
+// A 15-minute ticker would exhaust the entire monthly quota in under an hour.
+// Pass -reddit-once to run a single manual Reddit fetch cycle for testing.
 package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,12 +31,15 @@ import (
 )
 
 func main() {
+	redditOnce := flag.Bool("reddit-once", false, "run a single manual Reddit fetch cycle, then exit")
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	mongoURI := mustEnv("MONGO_URI")
 	redisURL := mustEnv("REDIS_URL")
-	redditClientID := mustEnv("REDDIT_CLIENT_ID")
-	redditClientSecret := mustEnv("REDDIT_CLIENT_SECRET")
+	redditAPIKey := mustEnv("REDDIT_RAPIDAPI_KEY")
+	redditAPIHost := mustEnv("REDDIT_RAPIDAPI_HOST")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -48,7 +58,7 @@ func main() {
 		}
 	}()
 
-	mongoStore, err := store.New(ctx, mongoClient)
+	mongoStore, err := store.New(ctx, mongoClient, "wantedby")
 	if err != nil {
 		logger.Error("mongo store init", "error", err)
 		os.Exit(1)
@@ -72,8 +82,17 @@ func main() {
 	publisher := queue.New(rdb)
 
 	// Adapters
-	redditAdapter := adapters.NewRedditAdapter(redditClientID, redditClientSecret, logger)
+	redditAdapter := adapters.NewRedditAdapter(redditAPIKey, redditAPIHost, logger)
 	hnAdapter := adapters.NewHNAdapter(logger)
+
+	// -reddit-once: run a single manual Reddit fetch and exit. Does not start the
+	// HTTP server or any tickers — this is a one-shot CLI test, not the service.
+	if *redditOnce {
+		logger.Info("running single manual reddit fetch cycle")
+		runAdapter(ctx, logger, redditAdapter, mongoStore, deduplicator, publisher)
+		logger.Info("manual reddit fetch cycle complete, exiting")
+		return
+	}
 
 	// HTTP server — /health and /metrics
 	mux := http.NewServeMux()
@@ -94,16 +113,14 @@ func main() {
 		}
 	}()
 
-	// Run one immediate fetch on startup, then on tickers
-	runAdapter(ctx, logger, redditAdapter, mongoStore, deduplicator, publisher)
+	// HN runs immediately and on its own ticker — free, unauthenticated, unlimited.
+	// Reddit does NOT run here automatically; see -reddit-once above.
 	runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher)
 
-	redditTicker := time.NewTicker(15 * time.Minute)
 	hnTicker := time.NewTicker(2 * time.Hour)
-	defer redditTicker.Stop()
 	defer hnTicker.Stop()
 
-	logger.Info("ingestor running", "reddit_interval", "15m", "hn_interval", "2h")
+	logger.Info("ingestor running", "hn_interval", "2h", "reddit", "manual only (-reddit-once)")
 
 	for {
 		select {
@@ -113,8 +130,6 @@ func main() {
 			defer shutCancel()
 			srv.Shutdown(shutCtx)
 			return
-		case <-redditTicker.C:
-			go runAdapter(ctx, logger, redditAdapter, mongoStore, deduplicator, publisher)
 		case <-hnTicker.C:
 			go runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher)
 		}

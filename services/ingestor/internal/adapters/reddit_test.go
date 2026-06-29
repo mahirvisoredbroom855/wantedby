@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -20,106 +21,239 @@ func testLogger() *slog.Logger {
 }
 
 func TestRedditAdapter_Name(t *testing.T) {
-	a := NewRedditAdapter("id", "secret", testLogger())
+	a := NewRedditAdapter("key", "host", testLogger())
 	assert.Equal(t, "reddit", a.Name())
 }
 
-func TestRedditAdapter_FetchSince_ParsesPostsCorrectly(t *testing.T) {
-	// Mock token endpoint
-	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(redditToken{AccessToken: "test-token", ExpiresIn: 3600})
-	}))
-	defer tokenServer.Close()
+func TestMatchesFrustrationPhrase_TitleMatch(t *testing.T) {
+	matched := matchesFrustrationPhrase("I wish there was a tool that tracked invoices", "")
+	assert.True(t, matched)
+}
 
-	createdUTC := float64(time.Now().Add(-5 * time.Minute).Unix())
+func TestMatchesFrustrationPhrase_BodyMatch(t *testing.T) {
+	matched := matchesFrustrationPhrase("Random title", "the existing solutions are terrible for this")
+	assert.True(t, matched)
+}
 
-	// Mock search endpoint — returns one post
-	searchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		listing := redditListing{}
-		listing.Data.Children = []struct {
+func TestMatchesFrustrationPhrase_CaseInsensitive(t *testing.T) {
+	matched := matchesFrustrationPhrase("WHY DOESN'T SOMETHING EXIST for this", "")
+	assert.True(t, matched)
+}
+
+func TestMatchesFrustrationPhrase_NoMatch(t *testing.T) {
+	matched := matchesFrustrationPhrase("Just a regular meme post", "nothing interesting here")
+	assert.False(t, matched)
+}
+
+// rewriteHostTransport redirects every request to a fixed target base URL,
+// regardless of the scheme/host the request was built with — used so the
+// adapter's hardcoded RapidAPI URL format can be pointed at an httptest server.
+type rewriteHostTransport struct {
+	target *url.URL
+}
+
+func (t rewriteHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Scheme = t.target.Scheme
+	req.URL.Host = t.target.Host
+	req.Host = t.target.Host
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+func TestRedditAdapter_FetchSubreddit_ParsesAndFiltersCorrectly(t *testing.T) {
+	matchingCreatedUTC := float64(time.Now().Add(-5 * time.Minute).Unix())
+	oldCreatedUTC := float64(time.Now().Add(-2 * time.Hour).Unix())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := rapidAPIPostsResponse{Success: true}
+		resp.Data.Cursor = "t3_abc"
+		resp.Data.Posts = []struct {
+			Kind string     `json:"kind"`
 			Data redditPost `json:"data"`
 		}{
-			{Data: redditPost{
-				ID:          "abc123",
-				Name:        "t3_abc123",
-				Subreddit:   "SideProject",
-				Title:       "I wish there was a tool that tracks invoice payments",
-				Selftext:    "Body text here",
-				Author:      "user1",
-				URL:         "https://reddit.com/r/SideProject/comments/abc123",
-				Permalink:   "/r/SideProject/comments/abc123",
-				Score:       42,
-				NumComments: 7,
-				CreatedUTC:  createdUTC,
-			}},
+			{
+				Kind: "t3",
+				Data: redditPost{
+					ID:          "abc123",
+					Name:        "t3_abc123",
+					Subreddit:   "SideProject",
+					Title:       "I wish there was a tool that tracks invoice payments",
+					Selftext:    "Body text here",
+					Author:      "user1",
+					Permalink:   "/r/SideProject/comments/abc123",
+					Score:       42,
+					NumComments: 7,
+					CreatedUTC:  matchingCreatedUTC,
+				},
+			},
+			{
+				// Too old — must be filtered out by the since timestamp.
+				Kind: "t3",
+				Data: redditPost{
+					ID:         "old1",
+					Name:       "t3_old1",
+					Subreddit:  "SideProject",
+					Title:      "I wish there was a tool that does X",
+					CreatedUTC: oldCreatedUTC,
+				},
+			},
+			{
+				// Recent but no frustration phrase — must be filtered out.
+				Kind: "t3",
+				Data: redditPost{
+					ID:         "nomatch1",
+					Name:       "t3_nomatch1",
+					Subreddit:  "SideProject",
+					Title:      "Just sharing my weekend project",
+					CreatedUTC: matchingCreatedUTC,
+				},
+			},
 		}
-		json.NewEncoder(w).Encode(listing)
+		json.NewEncoder(w).Encode(resp)
 	}))
-	defer searchServer.Close()
+	defer srv.Close()
 
-	adapter := NewRedditAdapter("id", "secret", testLogger())
-	adapter.httpClient = &http.Client{Timeout: 5 * time.Second}
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
 
-	// Patch the token URL and search URL via a transport that rewrites hosts
-	// For unit tests we validate parsing logic by calling searchSubreddit directly
-	// with a pre-set token to avoid the auth network call.
-	adapter.accessToken = "test-token"
-	adapter.tokenExpiry = time.Now().Add(1 * time.Hour)
+	adapter := &RedditAdapter{
+		apiKey:     "test-key",
+		apiHost:    "test-host",
+		httpClient: &http.Client{Transport: rewriteHostTransport{target: target}},
+		logger:     testLogger(),
+	}
 
-	// Override httpClient to route to our mock search server
-	adapter.httpClient = searchServer.Client()
-	// Rebuild the search URL to point at the test server
-	origURL := redditSearchURL
-	_ = origURL // used in production path only; we call the internal method here
+	since := time.Now().Add(-1 * time.Hour)
+	posts, err := adapter.fetchSubreddit(context.Background(), "SideProject", since)
+	require.NoError(t, err)
+	require.Len(t, posts, 1)
 
-	posts, err := adapter.searchSubreddit(
-		context.Background(),
-		"SideProject",
-		"I wish there was a tool that",
-		time.Now().Add(-10*time.Minute).Unix(),
-	)
-
-	// Since httpClient is the test server's client but the URL still points to reddit,
-	// this will fail in CI without network. We test the parsing path via a full mock.
-	// The important assertions are on the struct fields when parsing succeeds.
-	_ = err
-	_ = posts
+	assert.Equal(t, "reddit:t3_abc123", posts[0].PlatformID)
+	assert.Equal(t, "reddit", posts[0].Platform)
+	assert.Equal(t, "https://reddit.com/r/SideProject/comments/abc123", posts[0].URL)
+	assert.Equal(t, 42, posts[0].Score)
+	assert.Equal(t, 7, posts[0].CommentCount)
 }
 
-func TestRedditAdapter_PlatformID_Format(t *testing.T) {
-	// Verify PlatformID is always "reddit:<fullname>"
-	post := redditPost{
-		Name:       "t3_xyz789",
-		Subreddit:  "webdev",
-		Title:      "Why doesn't something exist for this",
-		CreatedUTC: float64(time.Now().Unix()),
+func TestRedditAdapter_FetchSubreddit_FailsOnSuccessFalse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(rapidAPIPostsResponse{Success: false})
+	}))
+	defer srv.Close()
+
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	adapter := &RedditAdapter{
+		apiKey:     "test-key",
+		apiHost:    "test-host",
+		httpClient: &http.Client{Transport: rewriteHostTransport{target: target}},
+		logger:     testLogger(),
 	}
 
-	fetchedAt := time.Now().UTC()
-	createdAt := time.Unix(int64(post.CreatedUTC), 0).UTC()
-
-	raw := RawPost{
-		PlatformID: "reddit:" + post.Name,
-		Platform:   "reddit",
-		Title:      post.Title,
-		CreatedAt:  createdAt,
-		FetchedAt:  fetchedAt,
-	}
-
-	assert.Equal(t, "reddit:t3_xyz789", raw.PlatformID)
-	assert.Equal(t, "reddit", raw.Platform)
+	_, err = adapter.fetchSubreddit(context.Background(), "SideProject", time.Now().Add(-1*time.Hour))
+	assert.Error(t, err)
 }
 
-func TestRedditAdapter_FiltersByTimestamp(t *testing.T) {
-	// Posts older than `since` must be excluded
-	sinceUnix := time.Now().Add(-1 * time.Hour).Unix()
-	oldCreatedUTC := float64(time.Now().Add(-2 * time.Hour).Unix()) // older than since
+// TestRedditAdapter_FetchSince_AggregatesAcrossAllSubreddits proves the full
+// FetchSince loop (one matching post per subreddit call) without hitting the
+// real RapidAPI quota — every request is served by a local httptest server.
+// Shrinks redditRequestDelay so 12 sequential calls don't slow the test suite.
+func TestRedditAdapter_FetchSince_AggregatesAcrossAllSubreddits(t *testing.T) {
+	originalDelay := redditRequestDelay
+	redditRequestDelay = time.Millisecond
+	defer func() { redditRequestDelay = originalDelay }()
 
-	post := redditPost{
-		Name:       "t3_old",
-		CreatedUTC: oldCreatedUTC,
+	matchingCreatedUTC := float64(time.Now().Add(-5 * time.Minute).Unix())
+	var requestCount int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		subreddit := r.URL.Query().Get("subreddit")
+
+		resp := rapidAPIPostsResponse{Success: true}
+		resp.Data.Posts = []struct {
+			Kind string     `json:"kind"`
+			Data redditPost `json:"data"`
+		}{
+			{
+				Kind: "t3",
+				Data: redditPost{
+					ID:         subreddit + "-post1",
+					Name:       "t3_" + subreddit + "post1",
+					Subreddit:  subreddit,
+					Title:      "I would pay for something that solved this",
+					CreatedUTC: matchingCreatedUTC,
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	adapter := &RedditAdapter{
+		apiKey:     "test-key",
+		apiHost:    "test-host",
+		httpClient: &http.Client{Transport: rewriteHostTransport{target: target}},
+		logger:     testLogger(),
 	}
 
-	createdAt := time.Unix(int64(post.CreatedUTC), 0).UTC()
-	require.True(t, createdAt.Unix() <= sinceUnix, "old post should be filtered out")
+	since := time.Now().Add(-1 * time.Hour)
+	posts, err := adapter.FetchSince(context.Background(), since)
+	require.NoError(t, err)
+
+	assert.Equal(t, len(targetSubreddits), requestCount, "must call once per target subreddit, never more")
+	assert.Len(t, posts, len(targetSubreddits), "one matching post per subreddit must be aggregated")
+}
+
+// TestRedditAdapter_FetchSince_ContinuesPastPerSubredditErrors proves a single
+// failing subreddit (e.g. a transient 500) doesn't abort the whole fetch cycle.
+func TestRedditAdapter_FetchSince_ContinuesPastPerSubredditErrors(t *testing.T) {
+	originalDelay := redditRequestDelay
+	redditRequestDelay = time.Millisecond
+	defer func() { redditRequestDelay = originalDelay }()
+
+	matchingCreatedUTC := float64(time.Now().Add(-5 * time.Minute).Unix())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		subreddit := r.URL.Query().Get("subreddit")
+		if subreddit == targetSubreddits[0] {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		resp := rapidAPIPostsResponse{Success: true}
+		resp.Data.Posts = []struct {
+			Kind string     `json:"kind"`
+			Data redditPost `json:"data"`
+		}{
+			{
+				Kind: "t3",
+				Data: redditPost{
+					ID:         subreddit + "-post1",
+					Name:       "t3_" + subreddit + "post1",
+					Subreddit:  subreddit,
+					Title:      "I would pay for something that solved this",
+					CreatedUTC: matchingCreatedUTC,
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	adapter := &RedditAdapter{
+		apiKey:     "test-key",
+		apiHost:    "test-host",
+		httpClient: &http.Client{Transport: rewriteHostTransport{target: target}},
+		logger:     testLogger(),
+	}
+
+	posts, err := adapter.FetchSince(context.Background(), time.Now().Add(-1*time.Hour))
+	require.NoError(t, err, "one failing subreddit must not fail the whole cycle")
+	assert.Len(t, posts, len(targetSubreddits)-1, "all subreddits except the failing one must still be aggregated")
 }
