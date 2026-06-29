@@ -1,0 +1,37 @@
+# Environment secrets — never committed
+.env
+.env.local
+.env.*.local
+
+# Go
+services/ingestor/ingestor
+services/ingestor/vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+services/api/dist/
+frontend/dist/
+
+# macOS
+.DS_Store
+
+# Terraform state (local runs — prod state lives in S3)
+infra/**/.terraform/
+infra/**/terraform.tfstate
+infra/**/terraform.tfstate.backup
+infra/**/.terraform.lock.hcl
+
+# IDE
+.idea/
+.vscode/
+*.swp
