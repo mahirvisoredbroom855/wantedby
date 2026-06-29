@@ -32,6 +32,8 @@ import (
 
 func main() {
 	redditOnce := flag.Bool("reddit-once", false, "run a single manual Reddit fetch cycle, then exit")
+	hnOnce := flag.Bool("hn-once", false, "run a single manual HN fetch cycle, then exit")
+	sinceHours := flag.Float64("since-hours", 16.0/60.0, "lookback window in hours for manual -*-once runs (default: 16 minutes, matching the ticker overlap)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -85,12 +87,20 @@ func main() {
 	redditAdapter := adapters.NewRedditAdapter(redditAPIKey, redditAPIHost, logger)
 	hnAdapter := adapters.NewHNAdapter(logger)
 
-	// -reddit-once: run a single manual Reddit fetch and exit. Does not start the
-	// HTTP server or any tickers — this is a one-shot CLI test, not the service.
+	since := time.Now().Add(-time.Duration(*sinceHours * float64(time.Hour)))
+
+	// -reddit-once / -hn-once: run a single manual fetch and exit. Does not start
+	// the HTTP server or any tickers — this is a one-shot CLI test, not the service.
 	if *redditOnce {
-		logger.Info("running single manual reddit fetch cycle")
-		runAdapter(ctx, logger, redditAdapter, mongoStore, deduplicator, publisher)
+		logger.Info("running single manual reddit fetch cycle", "since_hours", *sinceHours)
+		runAdapter(ctx, logger, redditAdapter, mongoStore, deduplicator, publisher, since)
 		logger.Info("manual reddit fetch cycle complete, exiting")
+		return
+	}
+	if *hnOnce {
+		logger.Info("running single manual hn fetch cycle", "since_hours", *sinceHours)
+		runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher, since)
+		logger.Info("manual hn fetch cycle complete, exiting")
 		return
 	}
 
@@ -115,7 +125,7 @@ func main() {
 
 	// HN runs immediately and on its own ticker — free, unauthenticated, unlimited.
 	// Reddit does NOT run here automatically; see -reddit-once above.
-	runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher)
+	runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher, since)
 
 	hnTicker := time.NewTicker(2 * time.Hour)
 	defer hnTicker.Stop()
@@ -131,12 +141,14 @@ func main() {
 			srv.Shutdown(shutCtx)
 			return
 		case <-hnTicker.C:
-			go runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher)
+			tickerSince := time.Now().Add(-16 * time.Minute) // slight overlap to avoid gaps between ticks
+			go runAdapter(ctx, logger, hnAdapter, mongoStore, deduplicator, publisher, tickerSince)
 		}
 	}
 }
 
-// runAdapter executes one full fetch cycle for a single platform adapter.
+// runAdapter executes one full fetch cycle for a single platform adapter,
+// fetching all posts published after since.
 func runAdapter(
 	ctx context.Context,
 	logger *slog.Logger,
@@ -144,9 +156,9 @@ func runAdapter(
 	mongoStore *store.MongoStore,
 	deduplicator *dedup.Deduplicator,
 	publisher *queue.Publisher,
+	since time.Time,
 ) {
 	platform := adapter.Name()
-	since := time.Now().Add(-16 * time.Minute) // slight overlap to avoid gaps on restarts
 
 	logger.Info("fetch cycle starting", "platform", platform)
 	timer := metrics.FetchDuration.WithLabelValues(platform)
