@@ -98,10 +98,13 @@ services:
       REDIS_URL: redis://redis:6379
       QDRANT_URL: http://qdrant:6333
       OLLAMA_URL: http://ollama:11434
+      DATABASE_URL: postgresql://wantedby:wantedby@postgres:5432/wantedby_db
     depends_on:
       mongodb:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
       qdrant:
         condition: service_healthy

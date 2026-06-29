@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     qdrant_url: str
     qdrant_api_key: str = ""
     ollama_url: str
+    database_url: str = ""
 
     anthropic_api_key: str = ""
     daily_token_budget_usd: float = 5.00
@@ -22,6 +23,8 @@ class Settings(BaseSettings):
 
     llm_model_dev: str = "llama3.2:3b"
     embedding_model: str = "nomic-embed-text"
+
+    producthunt_api_token: str = ""
 
 
 settings = Settings()
