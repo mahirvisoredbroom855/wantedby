@@ -1,0 +1,24 @@
+# Nightly clustering job, per the spec: runs at 02:00 UTC, never overlaps a
+# still-running execution, retries on failure via Kubernetes' own job restart.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pain-clustering
+  namespace: wantedby
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: clustering
+              image: "{{ .Values.classifier.image.repository }}:{{ .Values.classifier.image.tag }}"
+              command: ["python", "-m", "app.clustering.run"]
+              envFrom:
+                - secretRef:
+                    name: wantedby-classifier-secrets
+                - configMapRef:
+                    name: wantedby-classifier-config
