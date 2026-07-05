@@ -158,3 +158,38 @@ jobs:
           aws ecs wait services-stable \
             --cluster "$APP_NAME-prod" \
             --services "$APP_NAME-prod-api"
+
+  # ── Helm upgrade (k8s target, if KUBE_CONFIG secret is set) ─────────────────
+  helm-upgrade:
+    name: Helm upgrade
+    needs: [deploy-classifier, deploy-api]
+    runs-on: ubuntu-latest
+    environment: production
+    if: ${{ secrets.KUBE_CONFIG != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Write kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Helm upgrade
+        run: |
+          helm upgrade --install wantedby k8s/wantedby \
+            --namespace wantedby \
+            --create-namespace \
+            --values k8s/wantedby/values-prod.yaml \
+            --set api.image.repository=${{ steps.ecr.outputs.registry || '' }}/wantedby-api \
+            --set api.image.tag=${{ github.sha }} \
+            --set classifier.image.repository=${{ steps.ecr.outputs.registry || '' }}/wantedby-classifier \
+            --set classifier.image.tag=${{ github.sha }} \
+            --set ingestor.image.repository=${{ steps.ecr.outputs.registry || '' }}/wantedby-ingestor \
+            --set ingestor.image.tag=${{ github.sha }} \
+            --atomic \
+            --timeout 5m

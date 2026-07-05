@@ -1,0 +1,63 @@
+# Default values — override per environment with values-prod.yaml
+
+namespace: wantedby
+
+classifier:
+  image:
+    repository: ""  # set to ECR URI at deploy time
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+api:
+  image:
+    repository: ""
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  port: 4000
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+ingestor:
+  image:
+    repository: ""
+    tag: latest
+    pullPolicy: IfNotPresent
+  schedule: "0 */2 * * *"  # every 2 hours
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+clustering:
+  schedule: "0 2 * * *"  # 02:00 UTC nightly
+
+ingress:
+  enabled: true
+  className: nginx
+  host: ""  # set in values-prod.yaml
+  tlsSecret: wantedby-tls
+
+serviceAccount:
+  name: wantedby
