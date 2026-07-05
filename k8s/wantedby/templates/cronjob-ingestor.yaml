@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ingestor
+  namespace: {{ .Values.namespace }}
+spec:
+  schedule: {{ .Values.ingestor.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: {{ .Values.serviceAccount.name }}
+          containers:
+            - name: ingestor
+              image: "{{ .Values.ingestor.image.repository }}:{{ .Values.ingestor.image.tag }}"
+              imagePullPolicy: {{ .Values.ingestor.image.pullPolicy }}
+              envFrom:
+                - secretRef:
+                    name: wantedby-ingestor-secrets
+                - configMapRef:
+                    name: wantedby-ingestor-config
+              resources:
+                {{- toYaml .Values.ingestor.resources | nindent 16 }}

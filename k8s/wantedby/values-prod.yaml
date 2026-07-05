@@ -1,0 +1,17 @@
+# Production overrides — reference only, actual image tags set by CI at deploy time
+namespace: wantedby
+
+api:
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+
+classifier:
+  replicaCount: 1
+
+ingress:
+  enabled: true
+  host: "wantedby.io"
+  tlsSecret: wantedby-tls

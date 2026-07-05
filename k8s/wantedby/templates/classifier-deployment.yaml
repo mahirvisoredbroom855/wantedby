@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: classifier
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: classifier
+spec:
+  replicas: {{ .Values.classifier.replicaCount }}
+  selector:
+    matchLabels:
+      app: classifier
+  template:
+    metadata:
+      labels:
+        app: classifier
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      containers:
+        - name: classifier
+          image: "{{ .Values.classifier.image.repository }}:{{ .Values.classifier.image.tag }}"
+          imagePullPolicy: {{ .Values.classifier.image.pullPolicy }}
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: wantedby-classifier-secrets
+            - configMapRef:
+                name: wantedby-classifier-config
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.classifier.resources | nindent 12 }}
