@@ -1,0 +1,7 @@
+exclude = ["venv", ".venv", "__pycache__"]
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

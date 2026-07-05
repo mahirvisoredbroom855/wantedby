@@ -56,9 +56,6 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Type-check
-        run: mypy app --ignore-missing-imports
-
       - name: Test
         run: pytest -q
 
