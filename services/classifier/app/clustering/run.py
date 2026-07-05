@@ -7,8 +7,8 @@ import asyncio
 from datetime import datetime, timezone
 
 import asyncpg
-import httpx
 import hdbscan
+import httpx
 import numpy as np
 import structlog
 from motor.motor_asyncio import AsyncIOMotorClient
