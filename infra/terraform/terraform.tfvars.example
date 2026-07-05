@@ -1,0 +1,39 @@
+# Copy to terraform.tfvars (gitignored) and fill in before applying.
+
+aws_region  = "us-east-1"
+environment = "prod"
+app_name    = "wantedby"
+
+# ── Networking ─────────────────────────────────────────────────────────────────
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# ── Container images (fill in after first ECR push) ───────────────────────────
+ingestor_image   = "123456789.dkr.ecr.us-east-1.amazonaws.com/wantedby/ingestor:latest"
+classifier_image = "123456789.dkr.ecr.us-east-1.amazonaws.com/wantedby/classifier:latest"
+api_image        = "123456789.dkr.ecr.us-east-1.amazonaws.com/wantedby/api:latest"
+
+# ── RDS ────────────────────────────────────────────────────────────────────────
+rds_instance_class    = "db.t3.micro"
+rds_allocated_storage = 20
+db_name               = "wantedby_db"
+db_username           = "wantedby"
+
+# ── ElastiCache ────────────────────────────────────────────────────────────────
+redis_node_type = "cache.t3.micro"
+
+# ── Domain + TLS ───────────────────────────────────────────────────────────────
+domain_name         = "wantedby.io"
+acm_certificate_arn = ""  # Fill in after running: aws acm request-certificate --domain-name wantedby.io --validation-method DNS
+
+# ── Secrets (set via env vars or CI/CD secrets, not committed) ─────────────────
+mongo_uri             = ""   # MongoDB Atlas connection string
+auth0_domain          = ""   # e.g. dev-abc123.us.auth0.com
+auth0_audience        = "https://api.wantedby.io"
+stripe_secret_key     = ""
+stripe_webhook_secret = ""
+resend_api_key        = ""
+reddit_rapidapi_key   = ""
+anthropic_api_key     = ""
+producthunt_api_token = ""
+qdrant_api_key        = ""
