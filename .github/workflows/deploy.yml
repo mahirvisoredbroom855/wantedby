@@ -1,0 +1,160 @@
+name: Deploy Services
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - ".github/workflows/deploy.yml"
+
+concurrency:
+  group: deploy-services
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  APP_NAME: wantedby
+
+jobs:
+  # ── Build and push Docker images to ECR ─────────────────────────────────────
+  build-ingestor:
+    name: Build ingestor
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build & push
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE: ${{ env.APP_NAME }}-ingestor
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$REGISTRY/$IMAGE:$TAG" -t "$REGISTRY/$IMAGE:latest" services/ingestor
+          docker push "$REGISTRY/$IMAGE:$TAG"
+          docker push "$REGISTRY/$IMAGE:latest"
+          echo "image=$REGISTRY/$IMAGE:$TAG" >> "$GITHUB_OUTPUT"
+
+  build-classifier:
+    name: Build classifier
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build & push
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE: ${{ env.APP_NAME }}-classifier
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$REGISTRY/$IMAGE:$TAG" -t "$REGISTRY/$IMAGE:latest" services/classifier
+          docker push "$REGISTRY/$IMAGE:$TAG"
+          docker push "$REGISTRY/$IMAGE:latest"
+          echo "image=$REGISTRY/$IMAGE:$TAG" >> "$GITHUB_OUTPUT"
+
+  build-api:
+    name: Build API
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build & push
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE: ${{ env.APP_NAME }}-api
+          TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$REGISTRY/$IMAGE:$TAG" -t "$REGISTRY/$IMAGE:latest" services/api
+          docker push "$REGISTRY/$IMAGE:$TAG"
+          docker push "$REGISTRY/$IMAGE:latest"
+          echo "image=$REGISTRY/$IMAGE:$TAG" >> "$GITHUB_OUTPUT"
+
+  # ── Rolling ECS deploys (run after all images are pushed) ───────────────────
+  deploy-classifier:
+    name: Deploy classifier
+    needs: build-classifier
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "$APP_NAME-prod" \
+            --service "$APP_NAME-prod-classifier" \
+            --force-new-deployment \
+            --query "service.deployments[0].{status:status,desired:desiredCount,running:runningCount}" \
+            --output table
+
+      - name: Wait for stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$APP_NAME-prod" \
+            --services "$APP_NAME-prod-classifier"
+
+  deploy-api:
+    name: Deploy API
+    needs: build-api
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "$APP_NAME-prod" \
+            --service "$APP_NAME-prod-api" \
+            --force-new-deployment \
+            --query "service.deployments[0].{status:status,desired:desiredCount,running:runningCount}" \
+            --output table
+
+      - name: Wait for stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "$APP_NAME-prod" \
+            --services "$APP_NAME-prod-api"
